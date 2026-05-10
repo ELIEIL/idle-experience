@@ -66,7 +66,6 @@
         function initWebGL() {
             const canvas = document.getElementById('metaballs-canvas');
             canvas.width = window.innerWidth; canvas.height = window.innerHeight;
-            canvas.style.display='none';
             gl = canvas.getContext('webgl');
             if (!gl) { console.error('WebGL not supported'); return; }
             gl.getExtension('OES_standard_derivatives');
@@ -127,7 +126,7 @@
                     float t=iTime*0.4;
 
                     if(vMax>1.0){
-                        gl_FragColor=vec4(0.,0.,0.,0.);
+                        gl_FragColor=vec4(c*0.75,0.75);
                     } else {
                         gl_FragColor=vec4(0.0,0.0,0.0,0.0);
                     }
@@ -206,64 +205,18 @@
             asciiBgCtx = asciiBgCanvas.getContext('2d');
         }
 
-        function gridWrap(text, maxCols) {
-            const words=text.split(' '); const lines=[]; let line='';
-            for(const w of words){
-                const test=line?line+' '+w:w;
-                if(test.length>maxCols&&line){lines.push(line);line=w;}
-                else line=test;
-            }
-            if(line)lines.push(line); return lines;
-        }
-
-        function buildTextMap(W, H, CW, CH) {
-            const map=new Map();
-            const allBalls=[...motherBalls,...childBalls];
-            allBalls.forEach(b=>{
-                let text=null;
-                if(b.post) text=b.post.title;
-                else { const idx=motherBalls.indexOf(b); if(idx>=0&&headlines[idx]) text=headlines[idx].title; }
-                if(!text) return;
-                const cx=(b.x/100)*W, cy=H-(b.y/100)*H;
-                const gcx=Math.round(cx/CW), gcy=Math.round(cy/CH);
-                const maxCols=22;
-                const lines=gridWrap(text.toUpperCase(),maxCols);
-                lines.forEach((line,li)=>{
-                    const rowOff=(li-Math.floor(lines.length/2));
-                    const colOff=-Math.floor(maxCols/2);
-                    for(let ci=0;ci<line.length;ci++){
-                        const ch=line[ci]; if(ch===' ') continue;
-                        map.set((gcx+colOff+ci)+','+(gcy+rowOff),{char:ch,group:b.group});
-                    }
-                });
-            });
-            return map;
-        }
-
         function renderAsciiBackground(time) {
             if (!asciiBgCtx) return;
             const W=asciiBgCanvas.width, H=asciiBgCanvas.height;
             const CW=13, CH=17;
             const t=time*0.08, S=3.0;
             asciiBgCtx.clearRect(0,0,W,H);
-            asciiBgCtx.font = `600 ${CH}px "MDThermochrome",monospace`;
+            asciiBgCtx.font = `${CH}px "MDThermochrome",monospace`;
             asciiBgCtx.textBaseline='top';
             asciiBgCtx.textAlign='left';
             const rampDir=['-','/','|','\\'];
-            const textMap=buildTextMap(W,H,CW,CH);
             for(let py=0; py<H; py+=CH){
                 for(let px=0; px<W; px+=CW){
-                    const gridX=Math.floor(px/CW), gridY=Math.floor(py/CH);
-                    const textCell=textMap.get(gridX+','+gridY);
-                    if(textCell){
-                        const uvx2=(px+CW*0.5)/H, uvy2=(H-py-CH*0.5)/H;
-                        const bri2=(_turb(S*uvx2,S*uvy2,t)*0.5+0.5);
-                        const alpha2=Math.min(1.0,Math.max(0.12,bri2)*1.2);
-                        const gc=GROUP_RGB[textCell.group]||GROUP_RGB[0];
-                        asciiBgCtx.fillStyle='rgba('+gc[0]+','+gc[1]+','+gc[2]+','+alpha2+')';
-                        asciiBgCtx.fillText(textCell.char,px,py);
-                        continue;
-                    }
                     const uvx=(px+CW*0.5)/H;
                     const uvy=(H-py-CH*0.5)/H;
                     const cn=_turb(S*uvx,S*uvy,t);
@@ -284,7 +237,8 @@
                     else if(bri<0.70) char=(sec%2===0)?'+':'x';
                     else if(bri<0.87) char='#';
                     else              char='@';
-                    const alpha=Math.min(1.0,bri*1.2);
+                    const alpha=Math.min(0.75,bri*0.9);
+                    // Color by nearest mother ball group
                     const cbx=(px+CW*0.5)/W*100;
                     const cby=(H-py-CH*0.5)/H*100;
                     let tw=0,wr=0,wg=0,wb=0;
@@ -431,9 +385,11 @@
             motherBalls.forEach((b,i) => {
                 const body = Matter.Bodies.circle(
                     (b.x/100)*W, H-(b.y/100)*H, b.radius*rm,
-                    { frictionAir:1.0, restitution:0.0, isStatic:true }
+                    { frictionAir:0.001, restitution:0.45 }
                 );
-                Matter.Body.setVelocity(body, { x:0, y:0 });
+                Matter.Body.setVelocity(body, {
+                    x:(Math.random()-0.5)*2.5, y:(Math.random()-0.5)*2.5
+                });
                 Matter.Composite.add(world, body);
                 physicsBodies.mothers[i] = body;
             });
@@ -472,8 +428,8 @@
         function updateBalls(delta) {
             if (!matterEngine) return;
 
-            // Flow-field drift — disabled
-            const driftStrength = 0;
+            // Flow-field drift — balls swim through the visible background currents
+            const driftStrength = 0.00018;
             const maxSpd = 1.8;
             const t = performance.now()/1000;
             motherBalls.forEach((b,i) => {
@@ -518,42 +474,57 @@
 
         function drawBallText(b, isMother) {
             const W=overlayCanvas.width, H=overlayCanvas.height;
-            const cx=(b.x/100)*W, cy=H-(b.y/100)*H;
-            const fontSize=Math.round(Math.min(W,H)*(isMother?0.028:0.020));
-            const tracking=Math.round(fontSize*0.12);
-            const lineHeight=fontSize*1.4;
-            const maxLineW=fontSize*0.58*14;
-            const gc=['rgba(255,255,255,0.92)','rgba(130,130,255,0.92)','rgba(214,40,40,0.92)'];
-            const groupColor=gc[b.group]||gc[0];
+            const rm=Math.min(W,H)/200;
+            const cx=(b.x/100)*W, cy=H-(b.y/100)*H, r=b.radius*rm;
+            const fontSize=Math.round(Math.min(W,H)*(isMother?0.016:0.013));
+            const tracking=Math.round(fontSize*0.20);
+            const lineHeight=fontSize*1.55;
+            const charW_est=fontSize*0.65;
+            const maxTxtW=charW_est*(isMother?12:9);
+            const maxLines=isMother?6:4;
             overlayCtx.save();
-            overlayCtx.font=`900 ${fontSize}px "MDThermochrome","Courier New",monospace`;
-            overlayCtx.fillStyle=groupColor;
-            overlayCtx.textAlign='center';
-            overlayCtx.textBaseline='middle';
+            overlayCtx.beginPath(); overlayCtx.arc(cx,cy,r*0.97,0,Math.PI*2); overlayCtx.clip();
+            overlayCtx.font=`500 ${fontSize}px "MDThermochrome","Courier New",monospace`;
+            overlayCtx.fillStyle='rgba(255,255,255,0.95)'; overlayCtx.textAlign='center'; overlayCtx.textBaseline='middle';
             if('letterSpacing' in overlayCtx) overlayCtx.letterSpacing=`${tracking}px`;
-            let text;
-            if(isMother){
+
+            if (isMother) {
                 const idx=motherBalls.indexOf(b);
-                text=headlines[idx]?headlines[idx].title.toUpperCase():'LOADING...';
+                const text=headlines[idx]?headlines[idx].title.toUpperCase():'LOADING...';
+                let lines=wrapText(overlayCtx,text,maxTxtW);
+                if(lines.length>maxLines){lines=lines.slice(0,maxLines);lines[maxLines-1]=lines[maxLines-1].replace(/\s+\S*$/,'')+' ...';}  
+                const totalH=lines.length*lineHeight, startY=cy-totalH/2+lineHeight/2;
+                lines.forEach((ln,j)=>overlayCtx.fillText(ln,cx,startY+j*lineHeight));
             } else {
-                if(!b.post){overlayCtx.fillText('LOADING...',cx,cy);overlayCtx.restore();return;}
-                text=b.post.title.toUpperCase();
+                const post=b.post;
+                if (!post) { overlayCtx.fillText('LOADING...',cx,cy); overlayCtx.restore(); return; }
+                const metaFontSize=Math.max(7,Math.round(fontSize*0.75));
+                const titleMaxLines=Math.max(1,maxLines-2);
+                let titleLines=wrapText(overlayCtx,post.title.toUpperCase(),maxTxtW);
+                if(titleLines.length>titleMaxLines){titleLines=titleLines.slice(0,titleMaxLines);titleLines[titleMaxLines-1]=titleLines[titleMaxLines-1].replace(/\s+\S*$/,'')+' ...';}  
+                const titleH=titleLines.length*lineHeight;
+                const score=post.score>=1000?(post.score/1000).toFixed(1)+'K':String(post.score);
+                const meta=`u/${post.author}  ↑${score}  ${post.num_comments} comments`;
+                const totalH=titleH+metaFontSize*1.8+fontSize*0.4;
+                const startY=cy-totalH/2+lineHeight/2;
+                titleLines.forEach((ln,j)=>overlayCtx.fillText(ln,cx,startY+j*lineHeight));
+                overlayCtx.font=`500 ${metaFontSize}px "MDThermochrome","Courier New",monospace`;
+                overlayCtx.fillStyle='rgba(255,255,255,0.50)';
+                if('letterSpacing' in overlayCtx) overlayCtx.letterSpacing=`${Math.round(metaFontSize*0.15)}px`;
+                overlayCtx.fillText(meta,cx,startY+titleH+fontSize*0.4);
             }
-            const lines=wrapText(overlayCtx,text,maxLineW);
-            const totalH=lines.length*lineHeight;
-            const startY=cy-totalH/2+lineHeight/2;
-            lines.forEach((ln,j)=>overlayCtx.fillText(ln,cx,startY+j*lineHeight));
             overlayCtx.restore();
         }
 
-                function renderOverlay() {
+        function renderOverlay() {
             if (!overlayCtx) return;
             const W=overlayCanvas.width, H=overlayCanvas.height;
             overlayCtx.clearRect(0,0,W,H);
 
 
 
-
+            motherBalls.forEach(b=>drawBallText(b,true));
+            childBalls.forEach(b=>drawBallText(b,false));
         }
 
         // ── Data ───────────────────────────────────────────────────
@@ -572,7 +543,7 @@
 
         async function fetchAndAssignPosts() {
             try {
-                const res=await fetch('http://localhost:5001/api/reddit?subreddit=conspiracy%2Bunpopularopinion%2BAmItheAsshole%2Bpolitics%2BPoliticalDiscussion&limit=20');
+                const res=await fetch('http://localhost:5001/api/reddit?subreddit=worldnews&limit=12');
                 const posts=((await res.json()).posts||[]).sort(()=>Math.random()-.5);
                 let off=0;
                 for(let m=0;m<NUM_MOTHERS;m++){
