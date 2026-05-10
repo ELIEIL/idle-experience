@@ -49,9 +49,9 @@
         const MAX_BALLS = 15;
         const NUM_MOTHERS = 3;
 
-        const GROUP_CSS  = ['rgba(255,255,255,0.95)','rgba(130,130,255,0.95)','rgba(214,40,40,0.95)'];
-        const GROUP_GLSL = [[1.0,1.0,1.0],[0.51,0.51,1.0],[0.839,0.157,0.157]];
-        const GROUP_RGB  = [[255,255,255],[130,130,255],[214,40,40]];
+        const GROUP_CSS  = ['rgba(214,40,40,0.95)','rgba(0,0,254,0.95)','rgba(63,152,91,0.95)'];
+        const GROUP_GLSL = [[0.839,0.157,0.157],[0.0,0.0,0.996],[0.247,0.596,0.357]];
+        const GROUP_RGB  = [[214,40,40],[0,0,254],[63,152,91]];
 
         let motherBalls = [], childBalls = [], headlines = [];
         let gl, program, metaballsUniform, ballColorsUniform;
@@ -64,6 +64,7 @@
 
         // ── Slot animation state ───────────────────────────────────
         let postsPool = [];
+        let postQueue = [];
         let activeSlot = null;
         let slotIdleTimer = 0;
         let groupCycleIdx = 0;
@@ -577,13 +578,17 @@
 
         }
 
+        function getNextPost() {
+            if(postQueue.length===0) postQueue=shuffle([...postsPool]);
+            return postQueue.pop();
+        }
+
         // ── Slot animation ─────────────────────────────────────────
         function updateSlots(delta) {
             if(!postsPool.length) return;
             if(!activeSlot){
                 slotIdleTimer-=delta;
                 if(slotIdleTimer>0) return;
-                const post=postsPool[Math.floor(Math.random()*postsPool.length)];
                 const group=groupCycleIdx%3; groupCycleIdx++;
                 const CW=13,CH=17;
                 const W=asciiBgCanvas?asciiBgCanvas.width:window.innerWidth;
@@ -591,6 +596,7 @@
                 const pad=6;
                 const gcx=pad+Math.floor(Math.random()*(Math.floor(W/CW)-pad*2));
                 const gcy=pad+Math.floor(Math.random()*(Math.floor(H/CH)-pad*2));
+                const post=getNextPost();
                 activeSlot={post,group,gcx,gcy,charList:shuffle(buildCharList(post.title,gcx,gcy)),revealed:0,phase:'appearing',timer:0};
                 return;
             }
@@ -654,7 +660,7 @@
         async function init() {
             initWebGL(); initOverlay(); initialized=true;
             await loadPostsPool();
-            setInterval(refreshPostsPool, 5*60*1000); // refresh every 5 minutes
+            setInterval(refreshPostsPool, 5*60*1000);
             requestAnimationFrame(loop);
         }
         let lastTime=0;
