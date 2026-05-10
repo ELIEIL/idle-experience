@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metaballs with News Images</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            overflow: hidden;
+            background-color: #121212;
+        }
+
+        #canvas-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #metaballs-canvas {
+            width: 100%;
+            height: 100%;
+        }
+
+        .news-image {
+            position: absolute;
+            border-radius: 50%;
+            object-fit: cover;
+            opacity: 0.9;
+            transition: transform 0.3s ease;
+            pointer-events: none;
+            z-index: 10;
+            box-shadow: 0 0 20px rgba(255, 0, 36, 0.5);
+        }
+
+        .news-image:hover {
+            transform: scale(1.2);
+            z-index: 20;
+        }
+
+        .metaball-indicator {
+            display: none;
+        }
+
+        .headline-text {
+            position: absolute;
+            color: white;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            font-weight: bold;
+            text-align: center;
+            pointer-events: none;
+            z-index: 15;
+            text-shadow: 0 0 10px rgba(0, 0, 0, 0.8), 0 0 5px rgba(0, 0, 0, 0.6);
+            max-width: 150px;
+            word-wrap: break-word;
+            line-height: 1.2;
+            transform: translate(-50%, -50%);
+        }
+
+        #loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-family: Arial, sans-serif;
+            font-size: 24px;
+            z-index: 100;
+        }
+
+        #controls {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 10px;
+            color: white;
+            font-family: Arial, sans-serif;
+            z-index: 100;
+        }
+
+        #controls button {
+            margin: 5px;
+            padding: 8px 15px;
+            background: #ff0024;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        #controls button:hover {
+            background: #ff0033;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas id="metaballs-canvas"></canvas>
+    </div>
+
+    <div id="loading">Loading news images...</div>
+
+    <div id="controls">
+        <h3>Controls</h3>
+        <button onclick="refreshImages()">Refresh Images</button>
+        <button onclick="toggleImages()">Toggle Images</button>
+    </div>
+
+    <script src="metaballs-tracker.js"></script>
+    <script>
+        // Metaballs configuration
+        const metaballsOptions = {
+            numMetaballs: 10,
+            minRadius: 3,
+            maxRadius: 20,
+            speed: 5.0,
+            color: '#ff0024',
+            backgroundColor: '#121212'
+        };
+
+        let imagesVisible = true;
+        let newsImages = [];
+        let headlineElements = [];
+        let connectionLines = [];
+        let headlinePositions = []; // Store headline positions for collision
+        let metaballTracker;
+        let gl;
+        let program;
+        let metaballsUniform;
+        let imageTextures = [];
+        let initialized = false;
+
+        // Simple WebGL metaballs implementation
+        function initWebGLMetaballs() {
+            const canvas = document.getElementById('metaballs-canvas');
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+
+            gl = canvas.getContext('webgl');
+            if (!gl) {
+                console.error('WebGL not supported');
+                return;
+            }
+
+            // Vertex shader
+            const vertexShaderSource = `
+                attribute vec2 position;
+                void main() {
+                    gl_Position = vec4(position, 0.0, 1.0);
+                }
+            `;
+
+            // Fragment shader with texture support and dashed outline
+            const fragmentShaderSource = `
+                precision highp float;
+                uniform vec2 windowSize;
+                uniform vec3 metaballs[10];
+                uniform vec3 backgroundColor;
+                uniform sampler2D textures[10];
+
+                void main() {
+                    float radiusMultiplier = min(windowSize.x, windowSize.y) / 200.0;
+                    float xMultiplier = windowSize.x / 100.0;
+                    float yMultiplier = windowSize.y / 100.0;
+                    float x = gl_FragCoord.x;
+                    float y = gl_FragCoord.y;
+                    float v = 0.0;
+                    int closestMetaball = -1;
+                    float maxInfluence = 0.0;
+                    vec2 closestCenter = vec2(0.0);
+                    float closestRadius = 0.0;
+
+                    for (int i = 0; i < 10; i++) {
+                        vec3 mb = metaballs[i];
+                        float dx = abs((mb.x * xMultiplier) - x);
+                        dx = min(dx, windowSize.x - dx);
+                        float dy = abs((mb.y * yMultiplier) - y);
+                        dy = min(dy, windowSize.y - dy);
+                        float r = mb.z * radiusMultiplier;
+                        float influence = r * r / (dx * dx + dy * dy);
+                        v += influence;
+
+                        if (influence > maxInfluence) {
+                            maxInfluence = influence;
+                            closestMetaball = i;
+                            closestCenter = vec2(mb.x * xMultiplier, mb.y * yMultiplier);
+                            closestRadius = r;
+                        }
+                    }
+
+                    // Check if we're at the metaball edge (where v is close to 1.0)
+                    bool isMetaballEdge = (v > 0.99 && v < 1.01);
+
+                    if (v > 1.0 && closestMetaball >= 0) {
+                        // Calculate texture coordinates relative to metaball center
+                        vec2 texCoord = (gl_FragCoord.xy - closestCenter) / (closestRadius * 2.0) + 0.5;
+                        texCoord.y = 1.0 - texCoord.y; // Flip Y to fix upside-down images
+
+                        // Clamp texture coordinates to prevent cropping
+                        texCoord = clamp(texCoord, 0.0, 1.0);
+
+                        vec4 texColor;
+                        if (closestMetaball == 0) texColor = texture2D(textures[0], texCoord);
+                        else if (closestMetaball == 1) texColor = texture2D(textures[1], texCoord);
+                        else if (closestMetaball == 2) texColor = texture2D(textures[2], texCoord);
+                        else if (closestMetaball == 3) texColor = texture2D(textures[3], texCoord);
+                        else if (closestMetaball == 4) texColor = texture2D(textures[4], texCoord);
+                        else if (closestMetaball == 5) texColor = texture2D(textures[5], texCoord);
+                        else if (closestMetaball == 6) texColor = texture2D(textures[6], texCoord);
+                        else if (closestMetaball == 7) texColor = texture2D(textures[7], texCoord);
+                        else if (closestMetaball == 8) texColor = texture2D(textures[8], texCoord);
+                        else texColor = texture2D(textures[9], texCoord);
+
+                        // Create dashed pattern based on screen distance (generates more dashes when stretched)
+                        float dashSpacing = 5.0;
+                        float dashPattern = mod(length(gl_FragCoord.xy - closestCenter), dashSpacing * 2.0);
+                        bool isDash = dashPattern < dashSpacing;
+
+                        // Blend stroke with image
+                        float strokeAlpha = isMetaballEdge && isDash ? 1.0 : 0.0;
+                        gl_FragColor = mix(texColor, vec4(1.0, 1.0, 1.0, 1.0), strokeAlpha);
+                    } else if (isMetaballEdge) {
+                        // Render dashed outline outside metaball (edge where metaballs mix)
+                        float dashSpacing = 5.0;
+                        float dashPattern = mod(length(gl_FragCoord.xy - closestCenter), dashSpacing * 2.0);
+                        bool isDash = dashPattern < dashSpacing;
+
+                        if (isDash) {
+                            gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0); // White dashed outline
+                        } else {
+                            gl_FragColor = vec4(backgroundColor, 1.0);
+                        }
+                    } else {
+                        gl_FragColor = vec4(backgroundColor, 1.0);
+                    }
+                }
+            `;
+
+            // Compile shaders
+            const vertexShader = compileShader(gl, vertexShaderSource, gl.VERTEX_SHADER);
+            const fragmentShader = compileShader(gl, fragmentShaderSource, gl.FRAGMENT_SHADER);
+
+            if (!vertexShader || !fragmentShader) {
+                console.error('Failed to compile shaders');
+                return;
+            }
+
+            program = createProgram(gl, vertexShader, fragmentShader);
+
+            if (!program) {
+                console.error('Failed to create program');
+                return;
+            }
+
+            gl.useProgram(program);
+
+            // Set up geometry
+            const positions = new Float32Array([
+                -1.0, -1.0,
+                 1.0, -1.0,
+                -1.0,  1.0,
+                 1.0,  1.0
+            ]);
+
+            const positionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+            const positionAttribute = gl.getAttribLocation(program, 'position');
+            gl.enableVertexAttribArray(positionAttribute);
+            gl.vertexAttribPointer(positionAttribute, 2, gl.FLOAT, false, 0, 0);
+
+            // Get uniforms
+            metaballsUniform = gl.getUniformLocation(program, 'metaballs');
+            const windowSizeUniform = gl.getUniformLocation(program, 'windowSize');
+            const backgroundColorUniform = gl.getUniformLocation(program, 'backgroundColor');
+
+            // Set background color
+            const bgColor = hexToRgb(metaballsOptions.backgroundColor);
+            gl.uniform3fv(backgroundColorUniform, bgColor);
+            gl.uniform2fv(windowSizeUniform, [canvas.width, canvas.height]);
+
+            gl.viewport(0, 0, canvas.width, canvas.height);
+        }
+
+        function compileShader(gl, source, type) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vertexShader, fragmentShader) {
+            const program = gl.createProgram();
+            gl.attachShader(program, vertexShader);
+            gl.attachShader(program, fragmentShader);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error('Program link error:', gl.getProgramInfoLog(program));
+                gl.deleteProgram(program);
+                return null;
+            }
+            return program;
+        }
+
+        function hexToRgb(hex) {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? [
+                parseInt(result[1], 16) / 255,
+                parseInt(result[2], 16) / 255,
+                parseInt(result[3], 16) / 255
+            ] : [1, 0, 0.14];
+        }
+
+        function loadTextureFromBase64(base64Data, index) {
+            if (!gl) return null;
+
+            try {
+                // Create image from base64
+                const img = new Image();
+                img.src = `data:image/jpeg;base64,${base64Data}`;
+
+                return new Promise((resolve) => {
+                    img.onload = () => {
+                        const texture = gl.createTexture();
+                        gl.bindTexture(gl.TEXTURE_2D, texture);
+                        
+                        // Set texture parameters
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+                        // Upload image to texture
+                        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+
+                        imageTextures[index] = texture;
+                        resolve(texture);
+                    };
+                    img.onerror = () => {
+                        console.error(`Failed to load texture ${index}`);
+                        resolve(null);
+                    };
+                });
+            } catch (error) {
+                console.error(`Error loading texture ${index}:`, error);
+                return Promise.resolve(null);
+            }
+        }
+
+        async function loadAllTextures() {
+            // Try to load custom font, fall back to system font if it fails
+            try {
+                const font = new FontFace('MDThermochrome', 'url("MDThermochrome0.4-Regular-Trial.otf")');
+                document.fonts.add(font);
+                await font.load();
+            } catch (e) {
+                console.warn('Failed to load custom font, using fallback');
+            }
+
+            const promises = newsImages.slice(0, 10).map((imgData, index) => {
+                return loadCombinedTexture(imgData, index);
+            });
+            await Promise.all(promises);
+        }
+
+        function loadCombinedTexture(imgData, index) {
+            if (!gl) return null;
+
+            return new Promise((resolve) => {
+                // Create image from base64
+                const img = new Image();
+                img.src = `data:image/jpeg;base64,${imgData.data}`;
+
+                img.onload = () => {
+                    // Create canvas for image only (no text)
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    canvas.width = 512;
+                    canvas.height = 512;
+
+                    // Calculate aspect ratio to fit image without cropping
+                    const imgRatio = img.width / img.height;
+                    const canvasRatio = canvas.width / canvas.height;
+                    let drawWidth, drawHeight, drawX, drawY;
+
+                    if (imgRatio > canvasRatio) {
+                        drawWidth = canvas.width;
+                        drawHeight = canvas.width / imgRatio;
+                        drawX = 0;
+                        drawY = (canvas.height - drawHeight) / 2;
+                    } else {
+                        drawHeight = canvas.height;
+                        drawWidth = canvas.height * imgRatio;
+                        drawX = (canvas.width - drawWidth) / 2;
+                        drawY = 0;
+                    }
+
+                    // Draw image with aspect ratio preserved (fit, not cover)
+                    ctx.drawImage(img, drawX, drawY, drawWidth, drawHeight);
+
+                    // Create texture from canvas (image only)
+                    const texture = gl.createTexture();
+                    gl.bindTexture(gl.TEXTURE_2D, texture);
+
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+
+                    imageTextures[index] = texture;
+                    resolve(texture);
+                };
+
+                img.onerror = () => {
+                    console.error(`Failed to load image ${index}`);
+                    resolve(null);
+                };
+            });
+        }
+
+        function renderWebGLMetaballs() {
+            if (typeof metaballTracker === 'undefined' || !gl || !program || !metaballsUniform) return;
+
+            try {
+                const positions = metaballTracker.getPositions();
+                const metaballsData = new Float32Array(30); // 10 metaballs * 3 values (x, y, r)
+
+                positions.forEach((pos, i) => {
+                    metaballsData[i * 3] = pos.x;
+                    metaballsData[i * 3 + 1] = pos.y;
+                    metaballsData[i * 3 + 2] = pos.radius;
+                });
+
+                gl.uniform3fv(metaballsUniform, metaballsData);
+
+                // Bind textures (units 0-9)
+                for (let i = 0; i < 10; i++) {
+                    if (imageTextures[i]) {
+                        gl.activeTexture(gl.TEXTURE0 + i);
+                        gl.bindTexture(gl.TEXTURE_2D, imageTextures[i]);
+                        gl.uniform1i(gl.getUniformLocation(program, `textures[${i}]`), i);
+                    }
+                }
+
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            } catch (error) {
+                console.error('Error rendering metaballs:', error);
+            }
+        }
+
+        // Initialize metaballs
+        function initMetaballs() {
+            // Initialize custom tracker to track positions
+            metaballTracker = new MetaballTracker({
+                numMetaballs: metaballsOptions.numMetaballs,
+                minRadius: metaballsOptions.minRadius,
+                maxRadius: metaballsOptions.maxRadius,
+                speed: metaballsOptions.speed
+            });
+
+            // Initialize WebGL metaballs
+            initWebGLMetaballs();
+
+            initialized = true;
+            console.log('Metaballs initialized');
+
+            // Start animation loop to sync images with metaballs
+            requestAnimationFrame(animateImagesWithMetaballs);
+        }
+
+        // Fetch news images from Flask API
+        async function fetchNewsImages() {
+            try {
+                const response = await fetch('http://localhost:5001/api/images?keyword=news&limit=10');
+                const data = await response.json();
+                newsImages = data.images;
+                console.log(`Fetched ${newsImages.length} news images`);
+
+                // Load textures for WebGL
+                await loadAllTextures();
+
+                // Remove loading message
+                document.getElementById('loading').style.display = 'none';
+
+                // Create image elements (for overlay, optional)
+                createImageElements();
+            } catch (error) {
+                console.error('Failed to fetch news images:', error);
+                document.getElementById('loading').textContent = 'Failed to load images';
+            }
+        }
+
+        // Create image elements positioned at metaball locations
+        function createImageElements() {
+            createHeadlineElements();
+        }
+
+        function createHeadlineElements() {
+            // Clear existing elements
+            headlineElements.forEach(el => el.remove());
+            connectionLines.forEach(el => el.remove());
+            headlineElements = [];
+            connectionLines = [];
+            headlinePositions = [];
+
+            newsImages.slice(0, 10).forEach((imgData, index) => {
+                // Create headline element
+                const headline = document.createElement('div');
+                headline.className = 'headline-card';
+                headline.textContent = imgData.title.toUpperCase();
+                headline.style.cssText = `
+                    position: absolute;
+                    width: 200px;
+                    font-family: 'MDThermochrome', Arial, sans-serif;
+                    font-size: 14px;
+                    font-weight: bold;
+                    color: white;
+                    background: rgba(18, 18, 18, 0.9);
+                    padding: 10px;
+                    border: 2px solid white;
+                    border-radius: 4px;
+                    text-align: center;
+                    line-height: 1.3;
+                    word-wrap: break-word;
+                    pointer-events: none;
+                    z-index: 100;
+                `;
+                document.body.appendChild(headline);
+                headlineElements.push(headline);
+
+                // Initialize headline position
+                headlinePositions.push({
+                    x: 0,
+                    y: 0,
+                    vx: 0,
+                    vy: 0,
+                    width: 220, // 200px + 20px padding
+                    height: 50
+                });
+
+                // Create SVG connection line
+                const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                svg.style.cssText = `
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    pointer-events: none;
+                    z-index: 50;
+                `;
+                document.body.appendChild(svg);
+
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('stroke', 'white');
+                line.setAttribute('stroke-width', '2');
+                line.setAttribute('stroke-dasharray', '5,5');
+                svg.appendChild(line);
+                connectionLines.push({ svg, line, index });
+            });
+        }
+
+        function animateImagesWithMetaballs() {
+            if (!initialized || typeof metaballTracker === 'undefined') {
+                requestAnimationFrame(animateImagesWithMetaballs);
+                return;
+            }
+
+            metaballTracker.update();
+
+            renderWebGLMetaballs();
+
+            // Update headline positions and connection lines
+            const positions = metaballTracker.getPositions();
+            const canvasWidth = window.innerWidth;
+            const canvasHeight = window.innerHeight;
+
+            headlineElements.forEach((headline, index) => {
+                const pos = positions[index];
+                if (pos) {
+                    const metaballX = (pos.x / 100) * canvasWidth;
+                    const metaballY = (pos.y / 100) * canvasHeight;
+
+                    // Calculate desired headline position (center gravity to metaball)
+                    const desiredX = metaballX - 110; // Center headline on metaball (220px width / 2)
+                    const desiredY = metaballY - 25; // Center headline on metaball (50px height / 2)
+
+                    // Apply spring force to pull headline toward metaball
+                    const springStrength = 0.1;
+                    headlinePositions[index].vx += (desiredX - headlinePositions[index].x) * springStrength;
+                    headlinePositions[index].vy += (desiredY - headlinePositions[index].y) * springStrength;
+
+                    // Apply damping
+                    headlinePositions[index].vx *= 0.9;
+                    headlinePositions[index].vy *= 0.9;
+
+                    // Update headline position
+                    headlinePositions[index].x += headlinePositions[index].vx;
+                    headlinePositions[index].y += headlinePositions[index].vy;
+
+                    // Check collision with other metaballs
+                    positions.forEach((otherPos, otherIndex) => {
+                        if (otherIndex !== index) {
+                            const otherMetaballX = (otherPos.x / 100) * canvasWidth;
+                            const otherMetaballY = (otherPos.y / 100) * canvasHeight;
+                            const otherRadius = otherPos.radius * (Math.min(canvasWidth, canvasHeight) / 200.0);
+
+                            // Calculate distance between headline and other metaball
+                            const dx = headlinePositions[index].x + 110 - otherMetaballX;
+                            const dy = headlinePositions[index].y + 25 - otherMetaballY;
+                            const dist = Math.sqrt(dx * dx + dy * dy);
+                            const minDist = otherRadius + 50; // Metaball radius + buffer
+
+                            if (dist < minDist) {
+                                // Bounce headline off metaball
+                                const angle = Math.atan2(dy, dx);
+                                headlinePositions[index].vx += Math.cos(angle) * 5;
+                                headlinePositions[index].vy += Math.sin(angle) * 5;
+                            }
+                        }
+                    });
+
+                    // Apply position
+                    headline.style.left = headlinePositions[index].x + 'px';
+                    headline.style.top = headlinePositions[index].y + 'px';
+
+                    // Update connection line
+                    const conn = connectionLines[index];
+                    if (conn) {
+                        conn.line.setAttribute('x1', metaballX);
+                        conn.line.setAttribute('y1', metaballY);
+                        conn.line.setAttribute('x2', headlinePositions[index].x + 110);
+                        conn.line.setAttribute('y2', headlinePositions[index].y + 25);
+
+                        // Animate dash offset
+                        const dashOffset = (Date.now() / 20) % 10;
+                        conn.line.setAttribute('stroke-dashoffset', dashOffset);
+                    }
+                }
+            });
+
+            requestAnimationFrame(animateImagesWithMetaballs);
+        }
+
+        // Refresh images
+        async function refreshImages() {
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('loading').textContent = 'Refreshing images...';
+            await fetchNewsImages();
+        }
+
+        // Toggle image visibility
+        function toggleImages() {
+            imagesVisible = !imagesVisible;
+            imageElements.forEach(img => {
+                img.style.display = imagesVisible ? 'block' : 'none';
+            });
+        }
+
+        // Initialize
+        window.addEventListener('load', () => {
+            initMetaballs();
+            fetchNewsImages();
+        });
+
+        // Handle resize
+        window.addEventListener('resize', () => {
+            if (metaballTracker) {
+                metaballTracker.setCanvasSize(window.innerWidth, window.innerHeight);
+            }
+        });
+    </script>
+</body>
+</html>

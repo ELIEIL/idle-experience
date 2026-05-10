@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metaballs</title>
+    <style>
+        @font-face {
+            font-family: 'MDThermochrome';
+            src: url('MDThermochrome0.4-Regular-Trial.otf') format('opentype');
+            font-weight: normal;
+            font-style: normal;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            overflow: hidden;
+            background-color: #0b0701;
+        }
+
+        #canvas-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #metaballs-canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas id="metaballs-canvas"></canvas>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <script>
+        const BG_COLOR  = '#0b0701';
+        const MAX_BALLS = 15;
+        const NUM_MOTHERS = 3;
+
+        const GROUP_CSS  = ['rgba(255,255,255,0.95)','rgba(130,130,255,0.95)','rgba(214,40,40,0.95)'];
+        const GROUP_GLSL = [[1.0,1.0,1.0],[0.51,0.51,1.0],[0.839,0.157,0.157]];
+        const GROUP_RGB  = [[255,255,255],[130,130,255],[214,40,40]];
+
+        let motherBalls = [], childBalls = [], headlines = [];
+        let gl, program, metaballsUniform, ballColorsUniform;
+        let overlayCanvas, overlayCtx;
+        let asciiBgCanvas, asciiBgCtx;
+        let initialized = false;
+        let matterEngine = null;
+        const physicsBodies = { mothers: [], children: [] };
+        let timeUniform = null;
+
+        // ── WebGL ──────────────────────────────────────────────────
+        function initWebGL() {
+            const canvas = document.getElementById('metaballs-canvas');
+            canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+            gl = canvas.getContext('webgl');
+            if (!gl) { console.error('WebGL not supported'); return; }
+            gl.getExtension('OES_standard_derivatives');
+
+            const vs = `attribute vec2 p; void main(){gl_Position=vec4(p,0.,1.);}`;
+            const fs = `
+                #extension GL_OES_standard_derivatives : enable
+                precision highp float;
+                uniform vec2 windowSize; uniform vec3 metaballs[15];
+                uniform vec3 ballColors[15]; uniform vec3 bg; uniform float iTime;
+
+                vec3 hashN(vec3 p){
+                    p*=mat3(127.1,311.7,-53.7,269.5,183.3,77.1,-301.7,27.3,215.3);
+                    return 2.*fract(sin(p)*43758.5453123)-1.;
+                }
+                float noise3(vec3 p){
+                    vec3 i=floor(p),f=fract(p),u=f*f*(3.-2.*f);
+                    return 2.*mix(
+                        mix(mix(dot(hashN(i+vec3(0,0,0)),f-vec3(0,0,0)),dot(hashN(i+vec3(1,0,0)),f-vec3(1,0,0)),u.x),
+                            mix(dot(hashN(i+vec3(0,1,0)),f-vec3(0,1,0)),dot(hashN(i+vec3(1,1,0)),f-vec3(1,1,0)),u.x),u.y),
+                        mix(mix(dot(hashN(i+vec3(0,0,1)),f-vec3(0,0,1)),dot(hashN(i+vec3(1,0,1)),f-vec3(1,0,1)),u.x),
+                            mix(dot(hashN(i+vec3(0,1,1)),f-vec3(0,1,1)),dot(hashN(i+vec3(1,1,1)),f-vec3(1,1,1)),u.x),u.y),u.z);
+                }
+                float turb(vec2 U, float t){
+                    float f=0.,q=1.,s=0.;
+                    for(int i=0;i<2;i++){U-=t*vec2(.6,.2);f+=q*noise3(vec3(U,t));s+=q;q/=2.;U*=2.;t*=1.71;}
+                    return f/s;
+                }
+
+                void main(){
+                    float rm=min(windowSize.x,windowSize.y)/200.;
+                    float xm=windowSize.x/100.; float ym=windowSize.y/100.;
+                    float v0=0.,v1=0.,v2=0.;
+                    float mi0=0.,mi1=0.,mi2=0.;
+                    vec2 cc0=vec2(0.),cc1=vec2(0.),cc2=vec2(0.);
+                    float cr0=1.,cr1=1.,cr2=1.;
+                    for(int i=0;i<15;i++){
+                        vec3 mb=metaballs[i]; float r=mb.z*rm;
+                        if(r<0.001) continue;
+                        float dx=(mb.x*xm)-gl_FragCoord.x; float dy=(mb.y*ym)-gl_FragCoord.y;
+                        float inf=r*r/(dx*dx+dy*dy);
+                        vec3 bc=ballColors[i];
+                        if(bc.r>0.7&&bc.g>0.7){
+                            v0+=inf; if(inf>mi0){mi0=inf;cc0=vec2(mb.x*xm,mb.y*ym);cr0=r;}
+                        } else if(bc.b>bc.r+0.2){
+                            v1+=inf; if(inf>mi1){mi1=inf;cc1=vec2(mb.x*xm,mb.y*ym);cr1=r;}
+                        } else {
+                            v2+=inf; if(inf>mi2){mi2=inf;cc2=vec2(mb.x*xm,mb.y*ym);cr2=r;}
+                        }
+                    }
+                    float vMax=max(v0,max(v1,v2));
+                    vec3 c; vec2 cc; float cr;
+                    if(v0>=v1&&v0>=v2){c=vec3(1.,1.,1.);cc=cc0;cr=cr0;}
+                    else if(v1>=v2){c=vec3(0.51,0.51,1.);cc=cc1;cr=cr1;}
+                    else{c=vec3(0.839,0.157,0.157);cc=cc2;cr=cr2;}
+
+                    vec2 uv=gl_FragCoord.xy/windowSize.y;
+                    float t=iTime*0.4;
+
+                    if(vMax>1.0){
+                        gl_FragColor=vec4(c*0.75,0.75);
+                    } else {
+                        gl_FragColor=vec4(0.0,0.0,0.0,0.0);
+                    }
+                }`;
+
+            const vs_ = compileShader(gl, vs, gl.VERTEX_SHADER);
+            const fs_ = compileShader(gl, fs, gl.FRAGMENT_SHADER);
+            if (!vs_ || !fs_) return;
+            program = createProgram(gl, vs_, fs_);
+            if (!program) return;
+            gl.useProgram(program);
+
+            const buf = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+            const pa = gl.getAttribLocation(program, 'p');
+            gl.enableVertexAttribArray(pa);
+            gl.vertexAttribPointer(pa, 2, gl.FLOAT, false, 0, 0);
+
+            metaballsUniform  = gl.getUniformLocation(program, 'metaballs');
+            ballColorsUniform = gl.getUniformLocation(program, 'ballColors');
+            timeUniform       = gl.getUniformLocation(program, 'iTime');
+            gl.uniform2fv(gl.getUniformLocation(program,'windowSize'), [canvas.width, canvas.height]);
+            gl.uniform3fv(gl.getUniformLocation(program,'bg'), hexToRgb(BG_COLOR));
+            gl.viewport(0, 0, canvas.width, canvas.height);
+        }
+
+        function compileShader(gl, src, type) {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src); gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                console.error('Shader:', gl.getShaderInfoLog(s)); return null;
+            }
+            return s;
+        }
+        function createProgram(gl, v, f) {
+            const p = gl.createProgram();
+            gl.attachShader(p,v); gl.attachShader(p,f); gl.linkProgram(p);
+            if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+                console.error('Link:', gl.getProgramInfoLog(p)); return null;
+            }
+            return p;
+        }
+        function hexToRgb(hex) {
+            const r = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return r ? [parseInt(r[1],16)/255, parseInt(r[2],16)/255, parseInt(r[3],16)/255] : [0,0,0];
+        }
+
+        function renderWebGL() {
+            if (!gl || !program) return;
+            const all = getAllBalls();
+            const pos = new Float32Array(MAX_BALLS*3), col = new Float32Array(MAX_BALLS*3);
+            all.forEach((b,i) => {
+                pos[i*3]=b.x; pos[i*3+1]=b.y; pos[i*3+2]=b.radius;
+                const c = GROUP_GLSL[b.group]||GROUP_GLSL[0];
+                col[i*3]=c[0]; col[i*3+1]=c[1]; col[i*3+2]=c[2];
+            });
+            gl.uniform3fv(metaballsUniform, pos);
+            gl.uniform3fv(ballColorsUniform, col);
+            if(timeUniform) gl.uniform1f(timeUniform, performance.now()/1000);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+
+        // ── Overlay ────────────────────────────────────────────────
+        function initOverlay() {
+            overlayCanvas = document.createElement('canvas');
+            overlayCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;';
+            overlayCanvas.width = window.innerWidth; overlayCanvas.height = window.innerHeight;
+            document.getElementById('canvas-container').appendChild(overlayCanvas);
+            overlayCtx = overlayCanvas.getContext('2d');
+
+            asciiBgCanvas = document.createElement('canvas');
+            asciiBgCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:1;';
+            asciiBgCanvas.width = window.innerWidth; asciiBgCanvas.height = window.innerHeight;
+            document.getElementById('canvas-container').appendChild(asciiBgCanvas);
+            asciiBgCtx = asciiBgCanvas.getContext('2d');
+        }
+
+        function renderAsciiBackground(time) {
+            if (!asciiBgCtx) return;
+            const W=asciiBgCanvas.width, H=asciiBgCanvas.height;
+            const CW=13, CH=17;
+            const t=time*0.08, S=3.0;
+            asciiBgCtx.clearRect(0,0,W,H);
+            asciiBgCtx.font = `${CH}px "MDThermochrome",monospace`;
+            asciiBgCtx.textBaseline='top';
+            asciiBgCtx.textAlign='left';
+            const rampDir=['-','/','|','\\'];
+            for(let py=0; py<H; py+=CH){
+                for(let px=0; px<W; px+=CW){
+                    const uvx=(px+CW*0.5)/H;
+                    const uvy=(H-py-CH*0.5)/H;
+                    const cn=_turb(S*uvx,S*uvy,t);
+                    const bri=cn*0.5+0.5;
+                    if(bri<0.12) continue;
+                    const eps=0.001;
+                    const cnx=_turb(S*(uvx+eps),S*uvy,t);
+                    const cny=_turb(S*uvx,S*(uvy+eps),t);
+                    const vx=-(cny-cn)/eps*0.7;
+                    const vy=(cnx-cn)/eps*0.7;
+                    const ang=Math.atan2(vy,vx);
+                    const normAng=((ang%Math.PI)+Math.PI)%Math.PI;
+                    const sec=Math.floor(normAng/(Math.PI/4)+0.5)%4;
+                    let char;
+                    if(bri<0.25)      char='.';
+                    else if(bri<0.40) char=rampDir[sec];
+                    else if(bri<0.55) char=(sec===0||sec===3)?':':'=';
+                    else if(bri<0.70) char=(sec%2===0)?'+':'x';
+                    else if(bri<0.87) char='#';
+                    else              char='@';
+                    const alpha=Math.min(0.75,bri*0.9);
+                    // Color by nearest mother ball group
+                    const cbx=(px+CW*0.5)/W*100;
+                    const cby=(H-py-CH*0.5)/H*100;
+                    let tw=0,wr=0,wg=0,wb=0;
+                    for(const mb of motherBalls){
+                        const d=Math.hypot(cbx-mb.x,cby-mb.y);
+                        const w=Math.max(0,1-d/(mb.radius*3))**2;
+                        if(w>0){const gc=GROUP_RGB[mb.group]||GROUP_RGB[0];tw+=w;wr+=w*gc[0];wg+=w*gc[1];wb+=w*gc[2];}
+                    }
+                    let cr2,cg2,cb2;
+                    if(tw>0.02){cr2=Math.round(wr/tw);cg2=Math.round(wg/tw);cb2=Math.round(wb/tw);}
+                    else{cr2=cn>0?180:50;cg2=cn>0?45:70;cb2=cn>0?45:200;}
+                    asciiBgCtx.fillStyle=`rgba(${cr2},${cg2},${cb2},${alpha})`;
+                    asciiBgCtx.fillText(char,px,py);
+                }
+            }
+        }
+
+        // ── Text measurement ───────────────────────────────────────
+        let measureCtx = null;
+        function getMeasureCtx() {
+            if (!measureCtx) {
+                const c = document.createElement('canvas');
+                c.width=800; c.height=400;
+                measureCtx = c.getContext('2d');
+            }
+            return measureCtx;
+        }
+
+        // Returns the ideal radius (in 0-100 space) to hug the given text
+        function radiusForText(text, isMother) {
+            const W=window.innerWidth, H=window.innerHeight;
+            const rm=Math.min(W,H)/200;
+            const fs=Math.round(Math.min(W,H)*(isMother?0.016:0.013));
+            const lh=fs*1.55;
+            const ctx=getMeasureCtx();
+            ctx.font=`500 ${fs}px "MDThermochrome","Courier New",monospace`;
+            if('letterSpacing' in ctx) ctx.letterSpacing=`${Math.round(fs*0.20)}px`;
+            const charW=ctx.measureText('M').width;
+            const maxLineW=charW*(isMother?12:9);
+            let lines=wrapText(ctx,text.toUpperCase(),maxLineW);
+            const maxL=isMother?6:4;
+            lines=lines.slice(0,maxL);
+            let maxW=0;
+            for(const ln of lines) maxW=Math.max(maxW,ctx.measureText(ln).width);
+            const textH=lines.length*lh;
+            const totalH=isMother?textH:textH+fs*1.8;
+            const pad=fs*1.1;
+            const rPx=Math.hypot(maxW/2+pad, totalH/2+pad);
+            return Math.max(isMother?12:8, Math.min(isMother?40:24, Math.round(rPx/rm)));
+        }
+
+        // ── Ball management ────────────────────────────────────────
+        function initBalls() {
+            motherBalls = [
+                { x:22, y:68, vx:1.4, vy:0.9,  radius:24, group:0, driftAngle: Math.random()*Math.PI*2 },
+                { x:52, y:35, vx:-1.1,vy:1.7,  radius:26, group:1, driftAngle: Math.random()*Math.PI*2 },
+                { x:78, y:65, vx:1.2, vy:-1.4, radius:23, group:2, driftAngle: Math.random()*Math.PI*2 }
+            ];
+        }
+
+        function resizeBallsToContent() {
+            motherBalls.forEach((b,i) => {
+                if (headlines[i]) b.radius = radiusForText(headlines[i].title, true);
+            });
+            childBalls.forEach(cb => {
+                if (cb.post) cb.radius = radiusForText(cb.post.title, false);
+            });
+        }
+
+        function spawnChildren(motherIdx, posts) {
+            const mo = motherBalls[motherIdx];
+            const n  = Math.min(2+Math.floor(Math.random()*3), posts.length);
+            for (let j=0;j<n;j++) {
+                const a = (j/n)*Math.PI*2 + Math.random()*0.5;
+                childBalls.push({
+                    x: Math.max(5,Math.min(95, mo.x+Math.cos(a)*22)),
+                    y: Math.max(5,Math.min(95, mo.y+Math.sin(a)*18)),
+                    vx:(Math.random()-.5)*1.5, vy:(Math.random()-.5)*1.5,
+                    radius: 11,
+                    motherIdx, group:mo.group, post:posts[j]
+                });
+            }
+        }
+
+        function getAllBalls() {
+            const all = [...motherBalls,...childBalls];
+            while (all.length < MAX_BALLS) all.push({x:0,y:0,radius:0,group:0});
+            return all.slice(0, MAX_BALLS);
+        }
+
+        // ── JS Perlin noise (mirrors GLSL exactly for physics sync) ────────
+        const _fract = x => x - Math.floor(x);
+        function _hash3(px,py,pz){
+            const nx=px*127.1+py*311.7+pz*(-53.7);
+            const ny=px*269.5+py*183.3+pz*77.1;
+            const nz=px*(-301.7)+py*27.3+pz*215.3;
+            return [2*_fract(Math.sin(nx)*43758.5453123)-1,
+                    2*_fract(Math.sin(ny)*43758.5453123)-1,
+                    2*_fract(Math.sin(nz)*43758.5453123)-1];
+        }
+        function _noise3(px,py,pz){
+            const ix=Math.floor(px),iy=Math.floor(py),iz=Math.floor(pz);
+            const fx=px-ix,fy=py-iy,fz=pz-iz;
+            const ux=fx*fx*(3-2*fx),uy=fy*fy*(3-2*fy),uz=fz*fz*(3-2*fz);
+            const dot=(h,gx,gy,gz)=>h[0]*gx+h[1]*gy+h[2]*gz;
+            const lerp=(a,b,t)=>a+(b-a)*t;
+            return 2*lerp(
+                lerp(lerp(dot(_hash3(ix,iy,iz),fx,fy,fz),       dot(_hash3(ix+1,iy,iz),fx-1,fy,fz),ux),
+                     lerp(dot(_hash3(ix,iy+1,iz),fx,fy-1,fz),   dot(_hash3(ix+1,iy+1,iz),fx-1,fy-1,fz),ux),uy),
+                lerp(lerp(dot(_hash3(ix,iy,iz+1),fx,fy,fz-1),   dot(_hash3(ix+1,iy,iz+1),fx-1,fy,fz-1),ux),
+                     lerp(dot(_hash3(ix,iy+1,iz+1),fx,fy-1,fz-1),dot(_hash3(ix+1,iy+1,iz+1),fx-1,fy-1,fz-1),ux),uy),uz);
+        }
+        function _turb(inUx,inUy,inT){
+            let ux=inUx,uy=inUy,t=inT,f=0,q=1,s=0;
+            for(let i=0;i<2;i++){ux-=t*.6;uy-=t*.2;f+=q*_noise3(ux,uy,t);s+=q;q/=2;ux*=2;uy*=2;t*=1.71;}
+            return f/s;
+        }
+        function _flowAt(bx,by,time){
+            const W=window.innerWidth,H=window.innerHeight;
+            const uvx=(bx/100)*W/H, uvy=by/100;
+            const S=3., t=time*0.4, eps=0.001;
+            const n0=_turb(S*uvx,     S*uvy,     t);
+            const ny=_turb(S*uvx,     S*(uvy+eps),t);
+            const nx=_turb(S*(uvx+eps),S*uvy,    t);
+            return { x:-(ny-n0)/eps*0.7, y:(nx-n0)/eps*0.7 };
+        }
+
+        // ── Matter.js physics ──────────────────────────────────────
+        function initPhysics() {
+            const W=window.innerWidth, H=window.innerHeight, rm=Math.min(W,H)/200;
+            matterEngine = Matter.Engine.create({ gravity:{ x:0, y:0 } });
+            const world = matterEngine.world;
+
+            // Bounding walls
+            const t=60;
+            Matter.Composite.add(world, [
+                Matter.Bodies.rectangle(W/2, -t/2,   W+t*2, t, { isStatic:true }),
+                Matter.Bodies.rectangle(W/2,  H+t/2, W+t*2, t, { isStatic:true }),
+                Matter.Bodies.rectangle(-t/2,   H/2, t, H+t*2, { isStatic:true }),
+                Matter.Bodies.rectangle(W+t/2,  H/2, t, H+t*2, { isStatic:true })
+            ]);
+
+            // Mother bodies
+            motherBalls.forEach((b,i) => {
+                const body = Matter.Bodies.circle(
+                    (b.x/100)*W, H-(b.y/100)*H, b.radius*rm,
+                    { frictionAir:0.001, restitution:0.45 }
+                );
+                Matter.Body.setVelocity(body, {
+                    x:(Math.random()-0.5)*2.5, y:(Math.random()-0.5)*2.5
+                });
+                Matter.Composite.add(world, body);
+                physicsBodies.mothers[i] = body;
+            });
+
+            // Child bodies + spring constraints
+            childBalls.forEach((cb,j) => {
+                const rPx = cb.radius*rm;
+                const body = Matter.Bodies.circle(
+                    (cb.x/100)*W, H-(cb.y/100)*H, rPx,
+                    { frictionAir:0.04, restitution:0.3 }
+                );
+                Matter.Body.setVelocity(body, {
+                    x:(Math.random()-0.5)*2, y:(Math.random()-0.5)*2
+                });
+                Matter.Composite.add(world, body);
+                physicsBodies.children[j] = body;
+
+                const moBody = physicsBodies.mothers[cb.motherIdx];
+                const moR = motherBalls[cb.motherIdx].radius*rm;
+                const mergeDist = 2*Math.sqrt(moR*moR + rPx*rPx);
+                Matter.Composite.add(world, Matter.Constraint.create({
+                    bodyA: body, bodyB: moBody,
+                    length: mergeDist * 0.9,
+                    stiffness: 0.022, damping: 0.12
+                }));
+            });
+
+            // Mouse drag
+            const canvas = document.getElementById('metaballs-canvas');
+            const mouse = Matter.Mouse.create(canvas);
+            Matter.Composite.add(world, Matter.MouseConstraint.create(matterEngine, {
+                mouse, constraint:{ stiffness:0.15, damping:0.1 }
+            }));
+        }
+
+        function updateBalls(delta) {
+            if (!matterEngine) return;
+
+            // Flow-field drift — balls swim through the visible background currents
+            const driftStrength = 0.00018;
+            const maxSpd = 1.8;
+            const t = performance.now()/1000;
+            motherBalls.forEach((b,i) => {
+                const body = physicsBodies.mothers[i]; if(!body) return;
+                const flow = _flowAt(b.x, b.y, t);
+                const len = Math.hypot(flow.x, flow.y);
+                if(len > 0.0001) Matter.Body.applyForce(body, body.position, {
+                    x:  (flow.x/len) * driftStrength * body.mass,
+                    y: -(flow.y/len) * driftStrength * body.mass
+                });
+                const spd=Math.hypot(body.velocity.x, body.velocity.y);
+                if(spd>maxSpd) Matter.Body.setVelocity(body, {
+                    x: body.velocity.x*(maxSpd/spd),
+                    y: body.velocity.y*(maxSpd/spd)
+                });
+            });
+
+            Matter.Engine.update(matterEngine, delta);
+            const W=window.innerWidth, H=window.innerHeight;
+            motherBalls.forEach((b,i) => {
+                const body=physicsBodies.mothers[i]; if(!body) return;
+                b.x=(body.position.x/W)*100;
+                b.y=((H-body.position.y)/H)*100;
+            });
+            childBalls.forEach((cb,j) => {
+                const body=physicsBodies.children[j]; if(!body) return;
+                cb.x=(body.position.x/W)*100;
+                cb.y=((H-body.position.y)/H)*100;
+            });
+        }
+
+        // ── Rendering ──────────────────────────────────────────────
+        function wrapText(ctx, text, maxWidth) {
+            const words=text.split(' '); const lines=[]; let line='';
+            for(const w of words){
+                const t=line?line+' '+w:w;
+                if(ctx.measureText(t).width>maxWidth&&line){lines.push(line);line=w;}
+                else line=t;
+            }
+            if(line)lines.push(line); return lines;
+        }
+
+        function drawBallText(b, isMother) {
+            const W=overlayCanvas.width, H=overlayCanvas.height;
+            const rm=Math.min(W,H)/200;
+            const cx=(b.x/100)*W, cy=H-(b.y/100)*H, r=b.radius*rm;
+            const fontSize=Math.round(Math.min(W,H)*(isMother?0.016:0.013));
+            const tracking=Math.round(fontSize*0.20);
+            const lineHeight=fontSize*1.55;
+            const charW_est=fontSize*0.65;
+            const maxTxtW=charW_est*(isMother?12:9);
+            const maxLines=isMother?6:4;
+            overlayCtx.save();
+            overlayCtx.beginPath(); overlayCtx.arc(cx,cy,r*0.97,0,Math.PI*2); overlayCtx.clip();
+            overlayCtx.font=`500 ${fontSize}px "MDThermochrome","Courier New",monospace`;
+            overlayCtx.fillStyle='rgba(255,255,255,0.95)'; overlayCtx.textAlign='center'; overlayCtx.textBaseline='middle';
+            if('letterSpacing' in overlayCtx) overlayCtx.letterSpacing=`${tracking}px`;
+
+            if (isMother) {
+                const idx=motherBalls.indexOf(b);
+                const text=headlines[idx]?headlines[idx].title.toUpperCase():'LOADING...';
+                let lines=wrapText(overlayCtx,text,maxTxtW);
+                if(lines.length>maxLines){lines=lines.slice(0,maxLines);lines[maxLines-1]=lines[maxLines-1].replace(/\s+\S*$/,'')+' ...';}  
+                const totalH=lines.length*lineHeight, startY=cy-totalH/2+lineHeight/2;
+                lines.forEach((ln,j)=>overlayCtx.fillText(ln,cx,startY+j*lineHeight));
+            } else {
+                const post=b.post;
+                if (!post) { overlayCtx.fillText('LOADING...',cx,cy); overlayCtx.restore(); return; }
+                const metaFontSize=Math.max(7,Math.round(fontSize*0.75));
+                const titleMaxLines=Math.max(1,maxLines-2);
+                let titleLines=wrapText(overlayCtx,post.title.toUpperCase(),maxTxtW);
+                if(titleLines.length>titleMaxLines){titleLines=titleLines.slice(0,titleMaxLines);titleLines[titleMaxLines-1]=titleLines[titleMaxLines-1].replace(/\s+\S*$/,'')+' ...';}  
+                const titleH=titleLines.length*lineHeight;
+                const score=post.score>=1000?(post.score/1000).toFixed(1)+'K':String(post.score);
+                const meta=`u/${post.author}  ↑${score}  ${post.num_comments} comments`;
+                const totalH=titleH+metaFontSize*1.8+fontSize*0.4;
+                const startY=cy-totalH/2+lineHeight/2;
+                titleLines.forEach((ln,j)=>overlayCtx.fillText(ln,cx,startY+j*lineHeight));
+                overlayCtx.font=`500 ${metaFontSize}px "MDThermochrome","Courier New",monospace`;
+                overlayCtx.fillStyle='rgba(255,255,255,0.50)';
+                if('letterSpacing' in overlayCtx) overlayCtx.letterSpacing=`${Math.round(metaFontSize*0.15)}px`;
+                overlayCtx.fillText(meta,cx,startY+titleH+fontSize*0.4);
+            }
+            overlayCtx.restore();
+        }
+
+        function renderOverlay() {
+            if (!overlayCtx) return;
+            const W=overlayCanvas.width, H=overlayCanvas.height;
+            overlayCtx.clearRect(0,0,W,H);
+
+
+
+            motherBalls.forEach(b=>drawBallText(b,true));
+            childBalls.forEach(b=>drawBallText(b,false));
+        }
+
+        // ── Data ───────────────────────────────────────────────────
+        async function fetchHeadlines() {
+            try {
+                const res=await fetch('http://localhost:5001/api/headlines?keyword=world+news&limit=3');
+                headlines=(await res.json()).headlines||[];
+            } catch(e) {
+                headlines=[
+                    {title:'Global Leaders Meet on Climate Emergency'},
+                    {title:'Economic Tensions Rise Between Major Powers'},
+                    {title:'Conflict Escalates Across Multiple Regions'}
+                ];
+            }
+        }
+
+        async function fetchAndAssignPosts() {
+            try {
+                const res=await fetch('http://localhost:5001/api/reddit?subreddit=worldnews&limit=12');
+                const posts=((await res.json()).posts||[]).sort(()=>Math.random()-.5);
+                let off=0;
+                for(let m=0;m<NUM_MOTHERS;m++){
+                    const cnt=2+Math.floor(Math.random()*3);
+                    spawnChildren(m,posts.slice(off,off+cnt)); off+=cnt;
+                }
+            } catch(e){ console.warn('Reddit failed:',e); }
+        }
+
+        // ── Init & loop ────────────────────────────────────────────
+        async function init() {
+            initBalls(); initWebGL(); initOverlay(); initialized=true;
+            await Promise.all([fetchHeadlines(), fetchAndAssignPosts()]);
+            resizeBallsToContent();
+            initPhysics();
+            requestAnimationFrame(loop);
+        }
+        let lastTime=0;
+        function loop(t){
+            const delta=Math.min(t-lastTime, 50); lastTime=t;
+            updateBalls(delta||16.7);
+            renderWebGL(); renderAsciiBackground(t/1000); renderOverlay();
+            requestAnimationFrame(loop);
+        }
+
+        window.addEventListener('load', async () => {
+            await document.fonts.load('500 16px "MDThermochrome"');
+            init();
+        });
+        window.addEventListener('resize', () => {
+            const canvas=document.getElementById('metaballs-canvas');
+            if(canvas&&gl){
+                canvas.width=window.innerWidth; canvas.height=window.innerHeight;
+                gl.viewport(0,0,canvas.width,canvas.height);
+                gl.uniform2fv(gl.getUniformLocation(program,'windowSize'),[canvas.width,canvas.height]);
+            }
+            if(overlayCanvas){ overlayCanvas.width=window.innerWidth; overlayCanvas.height=window.innerHeight; }
+            if(asciiBgCanvas){ asciiBgCanvas.width=window.innerWidth; asciiBgCanvas.height=window.innerHeight; }
+        });
+    </script>
+</body>
+</html>
